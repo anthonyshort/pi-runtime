@@ -8,6 +8,7 @@ import {
 	getModel,
 	type Model,
 } from "@earendil-works/pi-ai/compat";
+import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
@@ -186,6 +187,63 @@ describe("RPC prompt response semantics", () => {
 	afterEach(() => {
 		rpcIo.outputLines = [];
 		rpcIo.lineHandler = undefined;
+	});
+
+	it("returns a direct tool receipt after progress and completion without an agent turn", async () => {
+		let release: (() => void) | undefined;
+		const pending = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const { lineHandler, runtimeHost, cleanup } = await startRpcMode({
+			withAuth: false,
+			responseDelayMs: 0,
+			extensionsResult: await createTestExtensionsResult([
+				(pi) => {
+					pi.registerTool({
+						name: "finish",
+						label: "finish",
+						description: "Save once",
+						parameters: Type.Object({ text: Type.String() }),
+						execute: async (...[, args, , update]) => {
+							update?.({ content: [{ type: "text", text: "saving" }], details: {} });
+							await pending;
+							return { content: [{ type: "text", text: args.text }], details: { saved: true } };
+						},
+					});
+				},
+			]),
+		});
+		try {
+			lineHandler(JSON.stringify({ id: "tool", type: "execute_tool", name: "finish", args: { text: "saved" } }));
+			await vi.waitFor(() =>
+				expect(parseOutputLines(rpcIo.outputLines).some((line) => line.type === "tool_execution_update")).toBe(
+					true,
+				),
+			);
+			expect(runtimeHost.session.isIdle).toBe(false);
+			expect(parseOutputLines(rpcIo.outputLines).filter((line) => line.id === "tool")).toEqual([]);
+			release?.();
+			await vi.waitFor(() =>
+				expect(parseOutputLines(rpcIo.outputLines)).toContainEqual({
+					id: "tool",
+					type: "response",
+					command: "execute_tool",
+					success: true,
+					data: {
+						result: { content: [{ type: "text", text: "saved" }], details: { saved: true }, isError: false },
+					},
+				}),
+			);
+			const lines = parseOutputLines(rpcIo.outputLines);
+			expect(lines.findIndex((line) => line.type === "tool_execution_end")).toBeLessThan(
+				lines.findIndex((line) => line.id === "tool"),
+			);
+			expect(lines.filter((line) => line.type === "agent_start" || line.type === "agent_settled")).toEqual([]);
+			expect(runtimeHost.session.isIdle).toBe(true);
+		} finally {
+			release?.();
+			await cleanup();
+		}
 	});
 
 	it("emits one failure response when prompt preflight rejects", async () => {

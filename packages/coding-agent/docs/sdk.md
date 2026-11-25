@@ -69,6 +69,24 @@ A steering message enters after the current assistant turn and its tool calls. A
 
 `abort()` stops the active operation and waits for the session to become idle. `waitForIdle()` waits without aborting it.
 
+## Executing a tool directly
+
+Use `session.executeTool(name, args)` when the host already knows which tool to call. Bind extensions first so their startup hooks have run:
+
+```typescript
+await session.bindExtensions({});
+const result = await session.executeTool("run_review", {});
+if (result.isError) throw new Error("Review failed");
+```
+
+This uses registered callable tools, schema validation and permission hooks without calling the parent model. Nested tools use the same pipeline. The operation emits ordinary tool progress events and returns after tool cleanup. It creates no assistant message or `agent_settled` event.
+
+The session stays busy until completion. `abort()` cancels the tool and waits for cleanup. Extension notifications remain context-only until an explicit `prompt`, so completion messages cannot start an unwanted model turn. For subprocesses, use the matching RPC [`execute_tool`](rpc-commands.md#execute_tool) command.
+
+Agent-core `beforeToolCall` and `afterToolCall` hooks now receive `origin: "model" | "host"`. Their `assistantMessage` field is absent for host calls. Hooks that read that message must check it exists first; model-issued calls still include it. Extension `tool_call` handlers can identify host calls through `event.origin === "host"`.
+
+An extra signal passed to `ctx.executeTool()` can cancel a nested call sooner. It does not replace the calling tool’s cancellation signal or allow a completed host context to start more work.
+
 ## Subscribing to events
 
 Subscribe before prompting when the host needs streamed output:

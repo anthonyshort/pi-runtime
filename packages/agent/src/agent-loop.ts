@@ -707,7 +707,7 @@ function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall)
 
 async function prepareToolCall(
 	currentContext: AgentContext,
-	assistantMessage: AssistantMessage,
+	assistantMessage: AssistantMessage | undefined,
 	toolCall: AgentToolCall,
 	config: ToolCallHooks,
 	signal: AbortSignal | undefined,
@@ -737,6 +737,7 @@ async function prepareToolCall(
 		if (config.beforeToolCall) {
 			const beforeResult = await config.beforeToolCall(
 				{
+					origin: assistantMessage ? "model" : "host",
 					assistantMessage,
 					toolCall,
 					args: validatedArgs,
@@ -793,8 +794,10 @@ function emitToolExecutionUpdate(toolCall: AgentToolCall, emit: AgentEventSink):
 export interface RunToolCallOptions extends ToolCallHooks {
 	/** Tools the call resolves against. */
 	tools: readonly AgentTool<any>[];
-	/** Passed to the hooks as the message that issued the call. */
-	assistantMessage: AssistantMessage;
+	/**
+	 * Passed to the hooks as the requesting message; absent for host-issued calls.
+	 */
+	assistantMessage?: AssistantMessage;
 	/** Passed to the hooks as the current agent context. */
 	context: AgentContext;
 	signal?: AbortSignal;
@@ -861,7 +864,7 @@ async function executePreparedToolCall(
 
 async function finalizeExecutedToolCall(
 	currentContext: AgentContext,
-	assistantMessage: AssistantMessage,
+	assistantMessage: AssistantMessage | undefined,
 	prepared: PreparedToolCall,
 	executed: ExecutedToolCallOutcome,
 	config: ToolCallHooks,
@@ -874,6 +877,7 @@ async function finalizeExecutedToolCall(
 		try {
 			const afterResult = await config.afterToolCall(
 				{
+					origin: assistantMessage ? "model" : "host",
 					assistantMessage,
 					toolCall: prepared.toolCall,
 					args: prepared.args,

@@ -4,6 +4,26 @@ This reference lists commands accepted on stdin in [RPC mode](rpc.md). Each comm
 
 ## Prompting
 
+### execute_tool
+
+Execute one callable tool without asking a model to launch it. The session must be idle. Arguments use the registered tool schema, and ordinary permission and result hooks still run. Host-issued `tool_call` events have `origin: "host"`, including nested calls.
+
+```json
+{"id": "review-1", "type": "execute_tool", "name": "run_review", "args": {}}
+```
+
+Tool progress streams as `tool_execution_start`, `tool_execution_update` and `tool_execution_end`. The correlated response arrives after execution and cleanup:
+
+```json
+{"id": "review-1", "type": "response", "command": "execute_tool", "success": true, "data": {"result": {"content": [{"type": "text", "text": "Saved"}], "details": {}, "isError": false}}}
+```
+
+`success: true` means the operation returned a tool result. Check `data.result.isError` for validation, permission or execution failures. A busy session or invalid command returns `success: false` with `error`.
+
+No assistant message or `agent_settled` event is created. Wait for the command response rather than an agent lifecycle event. `abort` cancels the operation and waits for tool cleanup. Prompts, steering and follow-ups are rejected while a direct tool runs.
+
+Extension notifications remain context-only, even when they request another turn or arrive after completion. A later explicit `prompt` restores normal model turns. The TypeScript client exposes `executeTool(name, args)` with no response timeout; call `abort()` when cancellation is needed.
+
 ### prompt
 
 Send a user prompt to the agent. The command response is emitted after the prompt is accepted, queued, or handled. Events continue streaming asynchronously after acceptance.

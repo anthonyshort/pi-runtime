@@ -406,6 +406,19 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			// Prompting
 			// =================================================================
 
+			case "execute_tool": {
+				activeCommands++;
+				void session
+					.executeTool(command.name, command.args)
+					.then((result) => output(success(id, "execute_tool", { result })))
+					.catch((e: unknown) => output(error(id, "execute_tool", e instanceof Error ? e.message : String(e))))
+					.finally(() => {
+						activeCommands--;
+						checkShutdownRequested();
+					});
+				return undefined;
+			}
+
 			case "prompt": {
 				// Start prompt handling immediately, but emit the authoritative response only after
 				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.

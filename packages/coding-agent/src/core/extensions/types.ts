@@ -392,7 +392,9 @@ export interface ExtensionContext {
 
 /** Options for {@link ExtensionToolContext.executeTool}. */
 export interface ExecuteToolOptions {
-	/** Defaults to the calling tool's signal. */
+	/**
+	 * Additional cancellation signal. The calling tool's cancellation still applies.
+	 */
 	signal?: AbortSignal;
 	/** Receives partial results of the nested tool, in addition to `tool_execution_update` events. */
 	onUpdate?: AgentToolUpdateCallback;
@@ -1221,6 +1223,10 @@ export type InputEventResult =
 
 interface ToolCallEventBase {
 	type: "tool_call";
+	/**
+	 * Set for host-issued root operations and their nested calls.
+	 */
+	origin?: "host";
 	/**
 	 * The call's id. For calls another tool made (with `parentToolCallId` set), pi assigns
 	 * `<parent id>/<n>`; such ids never appear as tool calls or tool results in the transcript, only

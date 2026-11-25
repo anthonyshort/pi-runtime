@@ -105,9 +105,17 @@ export interface AfterToolCallResult {
 
 /** Context passed to `beforeToolCall`. */
 export interface BeforeToolCallContext {
-	/** The assistant message that requested the tool call. */
-	assistantMessage: AssistantMessage;
-	/** The raw tool call block from `assistantMessage.content`. */
+	/**
+	 * Whether a model or the host requested the call.
+	 */
+	origin: "model" | "host";
+	/**
+	 * The requesting message; absent for host-issued calls.
+	 */
+	assistantMessage: AssistantMessage | undefined;
+	/**
+	 * The requested tool call block.
+	 */
 	toolCall: AgentToolCall;
 	/** Validated tool arguments for the target tool schema. */
 	args: unknown;
@@ -117,9 +125,17 @@ export interface BeforeToolCallContext {
 
 /** Context passed to `afterToolCall`. */
 export interface AfterToolCallContext {
-	/** The assistant message that requested the tool call. */
-	assistantMessage: AssistantMessage;
-	/** The raw tool call block from `assistantMessage.content`. */
+	/**
+	 * Whether a model or the host requested the call.
+	 */
+	origin: "model" | "host";
+	/**
+	 * The requesting message; absent for host-issued calls.
+	 */
+	assistantMessage: AssistantMessage | undefined;
+	/**
+	 * The requested tool call block.
+	 */
 	toolCall: AgentToolCall;
 	/** Validated tool arguments for the target tool schema. */
 	args: unknown;

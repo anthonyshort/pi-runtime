@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import {
@@ -24,7 +25,9 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	type AgentToolCall,
 	type AgentToolCallOutcome,
+	type AgentToolResult,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
 	type PrepareNextTurnContext,
@@ -37,6 +40,7 @@ import type {
 	AssistantMessage,
 	AuthResult,
 	ImageContent,
+	JsonObject,
 	Model,
 	ProviderHeaders,
 	SystemMessage,
@@ -417,6 +421,10 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	private _directToolAbortController: AbortController | undefined;
+	private _directToolCalls = new Set<Promise<AgentToolCallOutcome>>();
+	// Direct-tool sessions retain extension notifications without starting a model turn.
+	private _toolOnlyMode = false;
 	private _promptPreflightCount = 0;
 	private _agentRunAbortRequested = false;
 	private _idleWaitPromise: Promise<void> | undefined;
@@ -715,14 +723,15 @@ export class AgentSession {
 	 * happens here instead of in wrappers.
 	 */
 	private _installAgentToolHooks(): void {
-		this.agent.beforeToolCall = (context) => this._beforeToolCall(context);
-		this.agent.afterToolCall = (context) => this._afterToolCall(context);
+		this.agent.beforeToolCall = (context, signal) => this._beforeToolCall(context, undefined, signal);
+		this.agent.afterToolCall = (context, signal) => this._afterToolCall(context, undefined, signal);
 	}
 
 	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
 	private async _beforeToolCall(
-		{ toolCall, args }: BeforeToolCallContext,
+		{ toolCall, args, origin }: BeforeToolCallContext,
 		parentToolCallId?: string,
+		signal?: AbortSignal,
 	): Promise<BeforeToolCallResult | undefined> {
 		const runner = this._extensionRunner;
 		if (!runner.hasHandlers("tool_call")) {
@@ -730,13 +739,17 @@ export class AgentSession {
 		}
 
 		try {
-			return await runner.emitToolCall({
-				type: "tool_call",
-				toolName: toolCall.name,
-				toolCallId: toolCall.id,
-				...(parentToolCallId ? { parentToolCallId } : {}),
-				input: args as Record<string, unknown>,
-			});
+			return await runner.emitToolCall(
+				{
+					type: "tool_call",
+					toolName: toolCall.name,
+					toolCallId: toolCall.id,
+					...(origin === "host" ? { origin } : {}),
+					...(parentToolCallId ? { parentToolCallId } : {}),
+					input: args as Record<string, unknown>,
+				},
+				signal,
+			);
 		} catch (err) {
 			if (err instanceof Error) {
 				throw err;
@@ -749,21 +762,25 @@ export class AgentSession {
 	private async _afterToolCall(
 		{ toolCall, args, result, isError }: AfterToolCallContext,
 		parentToolCallId?: string,
+		signal?: AbortSignal,
 	): Promise<AfterToolCallResult | undefined> {
 		const runner = this._extensionRunner;
 		const hookResult = runner.hasHandlers("tool_result")
-			? await runner.emitToolResult({
-					type: "tool_result",
-					toolName: toolCall.name,
-					toolCallId: toolCall.id,
-					...(parentToolCallId ? { parentToolCallId } : {}),
-					input: args as Record<string, unknown>,
-					content: result.content,
-					details: result.details,
-					...(result.structuredContent === undefined ? {} : { structuredContent: result.structuredContent }),
-					isError,
-					usage: result.usage,
-				})
+			? await runner.emitToolResult(
+					{
+						type: "tool_result",
+						toolName: toolCall.name,
+						toolCallId: toolCall.id,
+						...(parentToolCallId ? { parentToolCallId } : {}),
+						input: args as Record<string, unknown>,
+						content: result.content,
+						details: result.details,
+						...(result.structuredContent === undefined ? {} : { structuredContent: result.structuredContent }),
+						isError,
+						usage: result.usage,
+					},
+					signal,
+				)
 			: undefined;
 
 		const content = hookResult?.content ?? result.content ?? [];
@@ -802,8 +819,8 @@ export class AgentSession {
 			getTools: () => this._getCallableTools(),
 			isSequential: () => this.agent.toolExecution === "sequential",
 			runToolCall: (toolCall, parentId, signal, onUpdate) => {
-				const assistantMessage = this._findLastAssistantMessage();
-				if (!assistantMessage) {
+				const assistantMessage = this._directToolAbortController ? undefined : this._findLastAssistantMessage();
+				if (!assistantMessage && !this._directToolAbortController) {
 					return Promise.resolve({
 						toolCall,
 						result: { content: [{ type: "text", text: "No assistant message issued this call" }], details: {} },
@@ -814,8 +831,8 @@ export class AgentSession {
 					tools: this._getCallableTools(),
 					assistantMessage,
 					context: { messages: this.agent.state.messages, tools: this.agent.state.tools },
-					beforeToolCall: (context) => this._beforeToolCall(context, parentId),
-					afterToolCall: (context) => this._afterToolCall(context, parentId),
+					beforeToolCall: (context, signal) => this._beforeToolCall(context, parentId, signal),
+					afterToolCall: (context, signal) => this._afterToolCall(context, parentId, signal),
 					signal,
 					onUpdate,
 				});
@@ -825,7 +842,76 @@ export class AgentSession {
 				this._emit(event);
 			},
 		});
-		return this._nestedToolCalls.execute(parentToolCallId, name, args, options);
+		const pending = this._nestedToolCalls.execute(parentToolCallId, name, args, options);
+		if (!this._directToolAbortController) return pending;
+		this._directToolCalls.add(pending);
+		try {
+			return await pending;
+		} finally {
+			this._directToolCalls.delete(pending);
+		}
+	}
+
+	private async _waitForDirectToolCalls(): Promise<void> {
+		while (this._directToolCalls.size > 0) await Promise.allSettled([...this._directToolCalls]);
+	}
+
+	/**
+	 * Execute one callable tool without a model turn. Arguments and permission hooks use the
+	 * ordinary tool pipeline. Progress is emitted, but no assistant message is invented.
+	 * Extension notifications remain context-only until the next explicit prompt.
+	 */
+	async executeTool(name: string, args: JsonObject): Promise<AgentToolResult<unknown>> {
+		if (typeof name !== "string" || !args || typeof args !== "object" || Array.isArray(args)) {
+			throw new Error("Tool name must be a string and arguments must be an object");
+		}
+		if (!this.isIdle || this._promptPreflightCount > 0) throw new Error("Session is busy");
+		const controller = new AbortController();
+		this._directToolAbortController = controller;
+		this._toolOnlyMode = true;
+		const toolCall: AgentToolCall = { type: "toolCall", id: `host-${randomUUID()}`, name, arguments: args };
+		try {
+			const start = { type: "tool_execution_start" as const, toolCallId: toolCall.id, toolName: name, args };
+			await this._extensionRunner.emit(start);
+			this._emit(start);
+			const outcome = await runToolCall(toolCall, {
+				tools: this._getCallableTools(),
+				context: { messages: this.agent.state.messages, tools: this.agent.state.tools },
+				beforeToolCall: (context, signal) => this._beforeToolCall(context, undefined, signal),
+				afterToolCall: (context, signal) => this._afterToolCall(context, undefined, signal),
+				signal: controller.signal,
+				onUpdate: async (partialResult) => {
+					const update = {
+						type: "tool_execution_update" as const,
+						toolCallId: toolCall.id,
+						toolName: name,
+						args,
+						partialResult,
+					};
+					await this._extensionRunner.emit(update);
+					this._emit(update);
+				},
+			});
+			await this._waitForDirectToolCalls();
+			const result = { ...outcome.result, isError: outcome.isError };
+			const end = {
+				type: "tool_execution_end" as const,
+				toolCallId: toolCall.id,
+				toolName: name,
+				result,
+				isError: outcome.isError,
+				...(outcome.durationMs === undefined ? {} : { durationMs: outcome.durationMs }),
+			};
+			await this._extensionRunner.emit(end);
+			this._emit(end);
+			return result;
+		} finally {
+			controller.abort();
+			await this._waitForDirectToolCalls();
+			this._nestedToolCalls?.takeRecord(toolCall.id);
+			this._directToolAbortController = undefined;
+			this._resolveIdleWaitIfIdle();
+		}
 	}
 
 	/** Whether `projection`, the current session projection, exceeds the compaction threshold of `model`. */
@@ -1480,6 +1566,7 @@ export class AgentSession {
 	 */
 	dispose(): void {
 		try {
+			this._directToolAbortController?.abort();
 			this.abortRetry();
 			this.abortCompaction();
 			this.abortBranchSummary();
@@ -1546,12 +1633,12 @@ export class AgentSession {
 
 	/** Whether the session is currently processing an agent run or post-run continuation. */
 	get isStreaming(): boolean {
-		return this._isAgentRunActive;
+		return this._isAgentRunActive || this._directToolAbortController !== undefined;
 	}
 
 	/** Whether the session has no active agent run, compaction, branch summary, retry, or queued continuation. */
 	get isIdle(): boolean {
-		return !this._isAgentRunActive && !this.isCompacting;
+		return !this._isAgentRunActive && !this._directToolAbortController && !this.isCompacting;
 	}
 
 	/** Current effective system prompt, including changes not yet sent to the model. */
@@ -2175,6 +2262,8 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		if (this._directToolAbortController) throw new Error("A direct tool operation is running");
+		this._toolOnlyMode = false;
 		if (this._isEmittingAgentSettled) {
 			this._deferredSettledActions.push(async () => await this.prompt(text, options));
 			return;
@@ -2343,6 +2432,7 @@ export class AgentSession {
 		behavior: "steer" | "followUp",
 		source: InputSource,
 	): Promise<QueuedInputDisposition> {
+		if (this._directToolAbortController) throw new Error("A direct tool operation is running");
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
 		}
@@ -2485,7 +2575,9 @@ export class AgentSession {
 			details: message.details,
 			timestamp: Date.now(),
 		} satisfies CustomMessage<T>;
-		if (options?.deliverAs === "nextTurn") {
+		if (this._toolOnlyMode) {
+			this._appendCustomMessage(appMessage);
+		} else if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
 		} else if (this.isStreaming && options?.triggerTurn !== false) {
 			if (options?.deliverAs === "followUp") {
@@ -2614,6 +2706,7 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		this._directToolAbortController?.abort();
 		if (this._isAgentRunActive) {
 			this._agentRunAbortRequested = true;
 		}

@@ -5,8 +5,8 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ImageContent } from "@earendil-works/pi-ai";
+import type { AgentMessage, AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { ImageContent, JsonObject } from "@earendil-works/pi-ai";
 import type { PromptDisposition, QueuedInputDisposition, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
@@ -189,6 +189,16 @@ export class RpcClient {
 	// =========================================================================
 	// Command Methods
 	// =========================================================================
+
+	/**
+	 * Execute a callable tool without a model turn. Resolves after tool hooks and cleanup;
+	 * onEvent() receives ordinary tool progress. Tool failures have result.isError set.
+	 * There is no response timeout; use abort() to cancel the operation.
+	 */
+	async executeTool(name: string, args: JsonObject): Promise<AgentToolResult<unknown>> {
+		const response = await this.send({ type: "execute_tool", name, args }, 0);
+		return this.getData<{ result: AgentToolResult<unknown> }>(response).result;
+	}
 
 	/**
 	 * Send a prompt to the agent.
@@ -553,7 +563,7 @@ export class RpcClient {
 		this.pendingRequests.clear();
 	}
 
-	private async send(command: RpcCommandBody): Promise<RpcResponse> {
+	private async send(command: RpcCommandBody, timeoutMs = 30000): Promise<RpcResponse> {
 		const childProcess = this.process;
 		const stdin = childProcess?.stdin;
 		if (!childProcess || !stdin) {
@@ -577,10 +587,13 @@ export class RpcClient {
 		const fullCommand = { ...command, id } as RpcCommand;
 
 		return new Promise((resolve, reject) => {
-			const timeout = setTimeout(() => {
-				this.pendingRequests.delete(id);
-				reject(new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.stderr}`));
-			}, 30000);
+			const timeout =
+				timeoutMs > 0
+					? setTimeout(() => {
+							this.pendingRequests.delete(id);
+							reject(new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.stderr}`));
+						}, timeoutMs)
+					: undefined;
 
 			this.pendingRequests.set(id, {
 				resolve: (response) => {

@@ -893,7 +893,7 @@ export class ExtensionRunner {
 	 * Create an ExtensionContext for use in event handlers and tool execution.
 	 * Context values are resolved at call time, so changes via bindCore/bindUI are reflected.
 	 */
-	createContext(): ExtensionContext {
+	createContext(signal?: AbortSignal): ExtensionContext {
 		const runner = this;
 		const getModel = this.getModel;
 		const getScopedModels = this.getScopedModels;
@@ -944,7 +944,7 @@ export class ExtensionRunner {
 			},
 			get signal() {
 				runner.assertActive();
-				return runner.getSignalFn();
+				return signal ?? runner.getSignalFn();
 			},
 			abort: () => {
 				runner.assertActive();
@@ -980,7 +980,7 @@ export class ExtensionRunner {
 	createToolContext(toolCallId: string, signal: AbortSignal | undefined): ExtensionToolContext {
 		const runner = this;
 		// createContext() returns a fresh object, so adding properties does not affect other contexts.
-		return Object.defineProperties(this.createContext() as ExtensionToolContext, {
+		return Object.defineProperties(this.createContext(signal) as ExtensionToolContext, {
 			tools: {
 				get() {
 					runner.assertActive();
@@ -1000,7 +1000,9 @@ export class ExtensionRunner {
 							isError: true,
 						};
 					}
-					return runner.executeToolFn(toolCallId, name, args, { ...options, signal: options.signal ?? signal });
+					const nestedSignal =
+						signal && options.signal ? AbortSignal.any([signal, options.signal]) : (options.signal ?? signal);
+					return runner.executeToolFn(toolCallId, name, args, { ...options, signal: nestedSignal });
 				},
 			},
 		});
@@ -1199,8 +1201,8 @@ export class ExtensionRunner {
 		return modified ? currentMessage : undefined;
 	}
 
-	async emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined> {
-		const ctx = this.createContext();
+	async emitToolResult(event: ToolResultEvent, signal?: AbortSignal): Promise<ToolResultEventResult | undefined> {
+		const ctx = this.createContext(signal);
 		const currentEvent: ToolResultEvent = { ...event };
 		let modified = false;
 
@@ -1258,8 +1260,8 @@ export class ExtensionRunner {
 		};
 	}
 
-	async emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined> {
-		const ctx = this.createContext();
+	async emitToolCall(event: ToolCallEvent, signal?: AbortSignal): Promise<ToolCallEventResult | undefined> {
+		const ctx = this.createContext(signal);
 		let result: ToolCallEventResult | undefined;
 
 		for (const { handlers } of snapshotEventHandlers(this.extensions, "tool_call")) {
